@@ -1,0 +1,4 @@
+[ 66%] Building CXX object CMakeFiles/sample_cublasLt_LtNvfp4Matmul.dir/main.cpp.o
+[ 66%] Building CUDA object CMakeFiles/sample_cublasLt_LtNvfp4Matmul.dir/sample_cublasLt_LtNvfp4Matmul.cu.o
+[100%] Linking CXX executable sample_cublasLt_LtNvfp4Matmul
+[100%] Built target sample_cublasLt_LtNvfp4Matmul
