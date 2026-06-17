@@ -1,7 +1,8 @@
-// Benchmark cuBLASLt NVFP4 dense GEMM: CUDA-graph replay x10 timed with cudaEvents.
-// Reproduces nvfp4_dense_gemm.csv. Matmul config is the LtNvfp4Matmul sample but with a bf16
-// output (no fp4 requant epilogue): A,B = CUDA_R_4F_E2M1 with VEC16 UE4M3 block scales,
-// C = bf16, D = bf16, transa=T transb=N, alpha=1 beta=0, heuristic-selected algo;
+// Benchmark cuBLASLt NVFP4 dense GEMM with an fp32 output (aligns with the DeepGEMM
+// FP4xFP4 path, whose D is fp32). Identical to bench_nvfp4.cu except D (and C) are fp32
+// instead of bf16: A,B = CUDA_R_4F_E2M1 with VEC16 UE4M3 block scales, C = fp32, D = fp32,
+// transa=T transb=N, alpha=1 beta=0, heuristic-selected algo. Timing = one CUDA graph of 10
+// back-to-back cublasLtMatmul, replayed once, timed with one cudaEvent pair -> us = elapsed/10.
 // TestBench (helpers.h) does the operand/scale alloc.
 #include <cublasLt.h>
 #include <cuda_runtime.h>
@@ -20,7 +21,11 @@
 
 #include "helpers.h"  // TestBench, StorageType, checkCublasStatus, checkCudaStatus
 
-// nvfp4 A/B -> bf16 output D (no output requant) — matches the reference (gbps counts a bf16 D).
+// TB only allocates/fills the fp4 A/B operands + UE4M3 scales (type-independent of the output),
+// so we keep the same bf16-output TB as bench_nvfp4.cu. The fp32 output D (and C) instead lives in
+// a separate device buffer allocated below — TestBench's fp4x2 fill path doesn't instantiate with a
+// float OutType, and we don't want to edit the shared helpers.h. With beta=0, C is never read, so a
+// single fp32 buffer of m*n floats serves as both C and D.
 using TB = TestBench<__nv_fp4_e2m1, __nv_bfloat16, float, __nv_fp8_e4m3, float, __nv_bfloat16>;
 
 // ---- NVML background sampler ----
@@ -49,7 +54,7 @@ template <typename Sel> static unsigned medianIn(double t0, double t1, Sel sel) 
 
 int main(int argc, char **argv) {
     const char *shapeFile = argc > 1 ? argv[1] : "shapes.txt";
-    const char *outFile = argc > 2 ? argv[2] : "../result/nvfp4_dense_gemm_repro.csv";
+    const char *outFile = argc > 2 ? argv[2] : "../result_v1/nvfp4_dense_gemm_fp32.csv";
     nvmlInit();
     nvmlDeviceGetHandleByIndex(0, &g_dev);
     std::thread th(sampler);
@@ -73,6 +78,10 @@ int main(int argc, char **argv) {
             cudaStream_t stream = props.stream;
             cublasLtHandle_t lt = props.ltHandle;
 
+            // fp32 output buffer (== DeepGEMM's fp32 D). beta=0 so C is unread -> reuse it for C and D.
+            float *Dfp32 = nullptr;
+            checkCudaStatus(cudaMalloc(reinterpret_cast<void **>(&Dfp32), (size_t)m * n * sizeof(float)));
+
             // ---- build matmul descriptors once (== LtNvfp4Matmul, but kept for graph capture) ----
             cublasLtMatmulDesc_t op = nullptr;
             cublasLtMatrixLayout_t Ad = nullptr, Bd = nullptr, Cd = nullptr, Dd = nullptr;
@@ -87,8 +96,8 @@ int main(int argc, char **argv) {
             checkCublasStatus(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &props.BscaleDev, sizeof(void *)));
             checkCublasStatus(cublasLtMatrixLayoutCreate(&Ad, CUDA_R_4F_E2M1, k, m, props.lda));
             checkCublasStatus(cublasLtMatrixLayoutCreate(&Bd, CUDA_R_4F_E2M1, k, n, props.ldb));
-            checkCublasStatus(cublasLtMatrixLayoutCreate(&Cd, CUDA_R_16BF, m, n, props.ldc));
-            checkCublasStatus(cublasLtMatrixLayoutCreate(&Dd, CUDA_R_16BF, m, n, props.ldd));
+            checkCublasStatus(cublasLtMatrixLayoutCreate(&Cd, CUDA_R_32F, m, n, props.ldc));
+            checkCublasStatus(cublasLtMatrixLayoutCreate(&Dd, CUDA_R_32F, m, n, props.ldd));
             checkCublasStatus(cublasLtMatmulPreferenceCreate(&pref));
             checkCublasStatus(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &WS, sizeof(WS)));
             int got = 0;
@@ -99,7 +108,7 @@ int main(int argc, char **argv) {
             } else {
                 auto matmul = [&]() {
                     checkCublasStatus(cublasLtMatmul(lt, op, &alpha, props.Adev, Ad, props.Bdev, Bd, &beta,
-                                                     props.Cdev, Cd, props.Ddev, Dd, &heur.algo, props.workspace, WS, stream));
+                                                     Dfp32, Cd, Dfp32, Dd, &heur.algo, props.workspace, WS, stream));
                 };
                 // warmup, then capture the matmul into a CUDA graph
                 for (int i = 0; i < 5; i++) matmul();
@@ -136,9 +145,10 @@ int main(int argc, char **argv) {
 
                 double secs = us * 1e-6;
                 double tflops = 2.0 * m * n * k / secs / 1e12;
-                double gbps = ((double)m * k * 0.5 + (double)n * k * 0.5 + (double)m * n * 2.0) / secs / 1e9;
+                // A,B packed fp4 (0.5 byte/elem) + fp32 output D (4 byte/elem).
+                double gbps = ((double)m * k * 0.5 + (double)n * k * 0.5 + (double)m * n * 4.0) / secs / 1e9;
                 out << m << "," << n << "," << k << "," << us << "," << tflops << "," << gbps << ","
-                    << smMhz << "," << pwW << ",cublaslt_nvfp4\n"; out.flush();
+                    << smMhz << "," << pwW << ",cublaslt_nvfp4_fp32\n"; out.flush();
                 printf("%6d%7d%7d | %9.2f %8.1f %9.1f | %6u %7u\n", m, n, k, us, tflops, gbps, smMhz, pwW);
 
                 cudaEventDestroy(s); cudaEventDestroy(e);
@@ -150,6 +160,7 @@ int main(int argc, char **argv) {
             if (Bd) cublasLtMatrixLayoutDestroy(Bd);
             if (Ad) cublasLtMatrixLayoutDestroy(Ad);
             if (op) cublasLtMatmulDescDestroy(op);
+            if (Dfp32) checkCudaStatus(cudaFree(Dfp32));
         } catch (const std::exception &ex) {
             printf("%6d%7d%7d | ERROR %s\n", m, n, k, ex.what());
         }
