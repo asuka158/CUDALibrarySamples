@@ -26,23 +26,47 @@ full transient from 2062 MHz down into throttle.
 ## Build / run
     export PATH=/usr/local/cuda/bin:$PATH
     nvcc -O3 -std=c++17 -arch=sm_100a bench_smmhz.cu -I../../Common -lcublasLt -lnvidia-ml -o bench_smmhz
-    ./bench_smmhz                                   # 16384^3, 1 replay/seg, 2.5s -> smmhz_16384.csv
-    ./bench_smmhz 16384 16384 16384 1 2.5 out.csv   # explicit args: m n k graphs_per_seg target_s out
+    ./bench_smmhz                                 # 16384^3, 2.5s, ~25ms/seg -> smmhz_16384.csv
+    ./bench_smmhz 16384 16384 16384 8.0 25 out.csv  # args: m n k total_sec seg_ms out.csv
 
-`graphs_per_seg` = replays between event markers (coarser granularity if >1). One replay = 10 GEMMs.
+The segment (one CSV row) is **auto-sized** to ~`seg_ms` from a per-GEMM calibration, so it works
+from 1K (single GEMM ~4 us) to 32K (single GEMM ~10 ms): it picks G (matmuls captured per graph,
+≤512) and graphs-per-segment so one segment ≈ seg_ms and ≥1 GEMM.
 
 ## CSV columns
-`seg, replay_start, replay_end, cum_run_ms, seg_ms, replay_us, tflops, sm_mhz, power_w`
-`cum_run_ms` is the continuous-run time (the x-axis); `replay_us` is per single GEMM.
+`seg, gemm_start, gemm_end, cum_run_ms, seg_ms, gemm_us, tflops, sm_mhz, power_w`
+`cum_run_ms` is the continuous-run time (the x-axis); `gemm_us` is per single GEMM.
 
-## Result (this run)
-Droop is real and tracks the 1200 W power cap, not a fixed time:
+## Result 1 — droop transient & true steady state (16384³, 9 s run)
 | cum_run | sm_mhz | tflops | power_w |
 |--------:|-------:|-------:|--------:|
-| ~50 ms  | 2062   | 8543   | 269 (power ramping) |
-| ~1.5 s  | ~1550  | ~7120  | ~1184 (at cap) |
-| ~2.9 s  | 1582   | 7265   | 1177 |
+| ~0.03 s | 2062   | 8413   | 329 (power ramping) |
+| ~0.5 s  | 1620   | 7441   | 671 |
+| ~1.0 s  | 1530   | 7219   | 1124 (power hits cap, clock undershoots) |
+| ~1.5 s  | 1567   | 7207   | 1176 |
+| 1.5→9.25 s | **1582 ±15** | **~7260 ±1%** | **1177–1178** |
 
-SM holds 2062 MHz while power climbs, then droops to ~1480–1580 MHz once power saturates the 1200 W
-cap; TFLOPS falls 8543 → ~7260 (~15%). I.e. the droop is power-cap driven and sets in after the
-power-management loop ramps to the cap (~hundreds of ms of continuous run), not instantly.
+The power loop ramps to the 1200 W cap over ~1 s (with a slight clock undershoot near 1.0 s), then
+**locks to a true steady state by ~1.5 s and stays flat through 9.25 s** (sm 1582 ±15 MHz, power
+1177–1178 W). So yes — beyond ~1.5 s it is genuinely stable; longer runtime brings no further droop.
+
+## Result 2 — shape sweep (`result/shape_sweep_summary.csv`)
+| shape | steady sm | droop | power | peak→steady TFLOPS | throttled |
+|------:|----------:|------:|------:|-------------------:|:---------:|
+| 1024³ | 2062 | 0%   | 393 W  | 665→664   | no |
+| 2048³ | 2062 | 0%   | 710 W  | 2751→2730 | no |
+| 4096³ | 2062 | 0%   | 1129 W | 5584→5534 | no (just under cap) |
+| 8192³ | 1642 | 20%  | 1178 W | 7356→6605 | **yes** |
+| 16384³| 1582 | 23%  | 1178 W | 8544→7248 | **yes** |
+| 32768³| 1455 | 29%  | 1181 W | 8224→6974 | **yes** |
+| 16384²×65536 | 1477 | 28% | 1180 W | 8565→7139 | **yes** |
+
+**The throttle is power-cap-driven, not runtime-driven per se.** Small/low-power shapes (≤4096³)
+never reach the 1200 W cap and hold 2062 MHz indefinitely — no droop no matter how long they run.
+Only shapes that saturate the cap (here ≥8192³) droop, and the droop deepens with intensity
+(20%→29%). "Continuous-run time" matters only because it takes ~1 s of sustained load for power to
+ramp to the cap; the steady clock is then set by how far over the cap the shape would push.
+
+Limit: square shapes >32768 (49152³, 65536³) fail — the **TestBench harness** overflows 32-bit
+element counts once a dimension product exceeds INT_MAX (√2³¹ ≈ 46340), so 32768³ is the largest
+power-of-two square. Not a GPU/NVFP4 limit (the k-heavy 16384²×65536 = 1.07e9 elems runs fine).
